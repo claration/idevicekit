@@ -155,6 +155,7 @@ extension HeartbeatManager {
 		
 		guard let pairingFile = getPairingRsd() else {
 			Logger.heartbeat.error("RSD pairing file not found")
+			isRestartInProgress = false
 			return false
 		}
 		
@@ -165,6 +166,8 @@ extension HeartbeatManager {
 		
 		guard inet_pton(AF_INET, ipAddress, &addr.sin_addr) == 1 else {
 			Logger.heartbeat.error("Invalid IP address")
+			rp_pairing_file_free(pairingFile)
+			isRestartInProgress = false
 			return false
 		}
 		
@@ -191,6 +194,8 @@ extension HeartbeatManager {
 		if let err = result {
 			let error = IDeviceSwiftError(err)
 			Logger.heartbeat.error("\(error): \(err.pointee.code)")
+			rp_pairing_file_free(pairingFile)
+			isRestartInProgress = false
 			return false
 		}
 				
