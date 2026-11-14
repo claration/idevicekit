@@ -6,6 +6,7 @@
 import Foundation
 import UIKit
 import OSLog
+import Network
 import IDevice
 
 // MARK: - Class extension: start
@@ -144,7 +145,23 @@ extension HeartbeatManager {
 
 	// MARK: - RSD Tunnel
 
-	internal func ensureRSDTunnel() -> Bool {
+    internal func ensureRSDTunnel() async -> Bool {
+        let port: UInt16 = await {
+            do {
+                return try await RsdPortResolver.resolve(timeout: 5)
+            } catch {
+                Logger.heartbeat.warning("Failed to resolve RSD port: \(error), using default")
+                return RsdPortResolver.fallback
+            }
+        }()
+        return ensureRSDTunnel(port: port)
+    }
+    
+    internal func ensureRSDTunnel() -> Bool {
+        ensureRSDTunnel(port: RsdPortResolver.fallback)
+    }
+    
+    internal func ensureRSDTunnel(port: UInt16) -> Bool {
 		guard !isRestartInProgress else {
 			return true
 		}
@@ -162,7 +179,7 @@ extension HeartbeatManager {
 		var addr = sockaddr_in()
 		memset(&addr, 0, MemoryLayout.size(ofValue: addr))
 		addr.sin_family = sa_family_t(AF_INET)
-		addr.sin_port = CFSwapInt16HostToBig(port_rsd)
+		addr.sin_port = CFSwapInt16HostToBig(port)
 		
 		guard inet_pton(AF_INET, ipAddress, &addr.sin_addr) == 1 else {
 			Logger.heartbeat.error("Invalid IP address")
@@ -312,4 +329,121 @@ extension HeartbeatManager {
 
 		heartbeat_client_free(heartbeatClient)
 	}
+}
+
+fileprivate final class RsdPortResolver: @unchecked Sendable {
+    static let fallback = UInt16(49152)
+    
+    private let queue = DispatchQueue(label: "rsdportresolver")
+    
+    private var timer: DispatchSourceTimer?
+    private var continuation: CheckedContinuation<UInt16, Error>?
+    
+    private var browser: NWBrowser?
+    private var connection: NWConnection?
+    private var discovered: UInt16?
+    
+    static func resolve(timeout: TimeInterval) async throws -> UInt16  {
+        let resolver = RsdPortResolver()
+        return try await withCheckedThrowingContinuation { continuation in
+            resolver.queue.async {
+                resolver.discover(timeout: timeout, continuation: continuation)
+            }
+        }
+    }
+    
+    private func resolveFromConn(_ conn: NWConnection) -> UInt16? {
+        guard case .hostPort(_, let port) = conn.currentPath?.remoteEndpoint else { return nil }
+        guard port.rawValue != 0 else { return nil }
+        return port.rawValue
+    }
+    private func stopDiscovery() {
+        browser?.cancel()
+        browser = nil
+        connection?.cancel()
+        connection = nil
+        timer?.cancel()
+        timer = nil
+    }
+    private func finish(_ result: Result<UInt16, Error>) {
+        guard let continuation else { return }
+        
+        self.continuation = nil
+        stopDiscovery()
+        
+        continuation.resume(with: result)
+    }
+    
+    private func discover(timeout: TimeInterval, continuation: CheckedContinuation<UInt16, Error>) {
+        guard self.browser == nil else { return }
+        
+        self.continuation = continuation
+        
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        self.timer = timer
+        
+        timer.schedule(deadline: .now() + timeout)
+        // strong ref, keep resolver alive
+        timer.setEventHandler { [self] in
+            finish(.failure(NSError(domain: "RsdPortResolver", code: -1001, userInfo: [NSLocalizedDescriptionKey: "Discover timed out"])))
+        }
+        timer.resume()
+        
+        let params: NWParameters = .tcp
+        params.includePeerToPeer = true
+        
+        let browser = NWBrowser(
+            for: .bonjour(type: "_remotepairing._tcp", domain: "local."),
+            using: params
+        )
+        self.browser = browser
+        
+        browser.browseResultsChangedHandler = { [weak self] results, _ in
+            guard let self, self.browser != nil else { return }
+            
+            let resultBonjour = results.filter {
+                if case .service = $0.endpoint { return true }
+                return false
+            }
+            guard let current = resultBonjour.first(where: { $0.interfaces.contains { $0.name.hasPrefix("lo") } }) ?? resultBonjour.first else { return }
+            
+            self.connection?.cancel()
+            let connection = NWConnection(to: current.endpoint, using: params)
+            self.connection = connection
+            
+            connection.pathUpdateHandler = { [weak self, weak connection] path in
+                guard let self, let connection, connection === self.connection else { return }
+                guard self.browser != nil else { return }
+                if path.status == .satisfied {
+                    discovered = self.resolveFromConn(connection)
+                    self.finish(.success(discovered ?? RsdPortResolver.fallback))
+                }
+            }
+            
+            connection.stateUpdateHandler = { [weak self, weak connection] state in
+                guard let self, let connection, connection === self.connection else { return }
+                guard self.browser != nil else { return }
+                
+                switch state {
+                case .ready, .waiting:
+                    discovered = self.resolveFromConn(connection)
+                    self.finish(.success(discovered ?? RsdPortResolver.fallback))
+                case .failed(let error):
+                    self.finish(.failure(error))
+                default:
+                    break
+                }
+            }
+            
+            connection.start(queue: self.queue)
+        }
+        
+        browser.stateUpdateHandler = { [weak self] state in
+            if case .failed(let error) = state {
+                self?.finish(.failure(error))
+            }
+        }
+        
+        browser.start(queue: queue)
+    }
 }

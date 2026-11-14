@@ -30,7 +30,6 @@ public class HeartbeatManager {
 	public var sessionId: UInt32? = nil
 	public let ipAddress: String = "10.7.0.1"
 	public let port: UInt16 = UInt16(LOCKDOWN_PORT)
-	public let port_rsd: UInt16 = UInt16(49152)
 	
 	public let restartLock = NSLock()
 	public var isRestartInProgress = false
